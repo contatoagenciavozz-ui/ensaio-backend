@@ -5,3 +5,4 @@ opencv-python-headless==4.10.0.84
 numpy==1.26.4
 mediapipe==0.10.14
 faster-whisper==1.0.3
+requests==2.32.3
