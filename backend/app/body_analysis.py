@@ -23,7 +23,7 @@ GESTURE_MODEL_PATH = "models/gesture_recognizer.task"
 SAMPLE_FPS = 5
 GAZE_DOWN_PITCH_DEG = 12
 GAZE_AWAY_YAW_DEG = 20
-ARM_DROP_RATIO = 0.08
+ARM_DROP_RATIO = 0.35            # wrist a até 35% do comprimento do tronco (ombro-quadril) do ponto do quadril = "braço na linha da cintura". 0.08 era tão apertado que quase nunca disparava — um braço relaxado normal já fica bem acima disso.
 HAND_MOVEMENT_ACTIVE_THRESHOLD = 0.02
 WRIST_VISIBILITY_THRESHOLD = 0.3
 POCKET_STREAK_SECONDS = 1.5
@@ -330,7 +330,13 @@ def summarize(signals, hand_movement_frames, both_wrists_hidden_frames, both_wri
     face_frames = [s for s in signals if s.has_face]
     n_face = len(face_frames)
     down_frames = sum(1 for s in face_frames if s.pitch_deg is not None and s.pitch_deg < -GAZE_DOWN_PITCH_DEG)
-    away_frames = sum(1 for s in face_frames if s.yaw_deg is not None and abs(s.yaw_deg) > GAZE_AWAY_YAW_DEG)
+    # "Desviou o olhar" só conta quadros que NÃO já foram contados como
+    # "olhou pra baixo" — sem isso, um quadro com cabeça baixa E virada
+    # pro lado entrava nas duas contagens, subtraindo em dobro do contato
+    # visual (podendo até dar percentual negativo). Prioridade: pitch
+    # (olhar pra baixo) vem primeiro; yaw só conta no que sobrar.
+    away_frames = sum(1 for s in face_frames if s.yaw_deg is not None and abs(s.yaw_deg) > GAZE_AWAY_YAW_DEG
+                       and not (s.pitch_deg is not None and s.pitch_deg < -GAZE_DOWN_PITCH_DEG))
     forward_frames = n_face - down_frames - away_frames
 
     smile_frames = [s for s in face_frames if s.smile_score is not None]
