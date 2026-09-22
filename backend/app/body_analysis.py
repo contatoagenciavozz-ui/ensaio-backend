@@ -146,39 +146,26 @@ def longest_invisible_streak_seconds(pose_frames, side_attr):
     return round(longest * avg_gap, 1), (round(best_start, 1) if best_start is not None else None)
 
 
-def analyze_body_language(video_path: str) -> dict:
+def _sample_frame_indices(video_path: str):
+    """Abre o vídeo só pra calcular o intervalo de amostragem — usado
+    igual nas três passadas, pra garantir que os timestamps batem."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise ValueError(f"Não consegui abrir o vídeo: {video_path}")
-
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    cap.release()
     frame_interval = max(1, round(src_fps / SAMPLE_FPS))
+    return frame_interval, src_fps
 
+
+def _run_face_pass(video_path: str, frame_interval: int):
     face_options = mp_vision.FaceLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL_PATH),
         running_mode=mp_vision.RunningMode.VIDEO, num_faces=1, output_face_blendshapes=True,
     )
-    pose_options = mp_vision.PoseLandmarkerOptions(
-        base_options=mp_python.BaseOptions(model_asset_path=POSE_MODEL_PATH),
-        running_mode=mp_vision.RunningMode.VIDEO, num_poses=1,
-    )
-    gesture_options = mp_vision.GestureRecognizerOptions(
-        base_options=mp_python.BaseOptions(model_asset_path=GESTURE_MODEL_PATH),
-        running_mode=mp_vision.RunningMode.VIDEO, num_hands=2,
-    )
-
-    signals = []
-    prev_wrists = {"left": None, "right": None}
-    hand_movement_frames = {"left": 0, "right": 0}
-    both_wrists_hidden_frames = 0
-    both_wrists_hidden_longest = 0
-    both_wrists_hidden_current = 0
-    unusual_gesture_raw = []
-
-    with mp_vision.FaceLandmarker.create_from_options(face_options) as face_lm, \
-         mp_vision.PoseLandmarker.create_from_options(pose_options) as pose_lm, \
-         mp_vision.GestureRecognizer.create_from_options(gesture_options) as gesture_lm:
-
+    results = []
+    cap = cv2.VideoCapture(video_path)
+    with mp_vision.FaceLandmarker.create_from_options(face_options) as face_lm:
         frame_idx = 0
         while True:
             ok, frame = cap.read()
@@ -187,24 +174,56 @@ def analyze_body_language(video_path: str) -> dict:
             if frame_idx % frame_interval != 0:
                 frame_idx += 1
                 continue
-
             t_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC))
             h, w = frame.shape[:2]
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-            sig = FrameSignals(t=t_ms / 1000.0)
-
+            sig = {"t": t_ms / 1000.0, "has_face": False, "yaw_deg": None, "pitch_deg": None, "smile_score": None}
             face_result = face_lm.detect_for_video(mp_image, t_ms)
             if face_result.face_landmarks:
                 yaw, pitch = estimate_head_pose(face_result.face_landmarks[0], w, h)
                 if yaw is not None:
-                    sig.has_face = True
-                    sig.yaw_deg = yaw
-                    sig.pitch_deg = pitch
+                    sig["has_face"] = True
+                    sig["yaw_deg"] = yaw
+                    sig["pitch_deg"] = pitch
                 if face_result.face_blendshapes:
                     cats = face_result.face_blendshapes[0]
-                    sig.smile_score = (get_blendshape_score(cats, "mouthSmileLeft") + get_blendshape_score(cats, "mouthSmileRight")) / 2
+                    sig["smile_score"] = (get_blendshape_score(cats, "mouthSmileLeft") + get_blendshape_score(cats, "mouthSmileRight")) / 2
+            results.append(sig)
+            frame_idx += 1
+    cap.release()
+    return results
+
+
+def _run_pose_pass(video_path: str, frame_interval: int):
+    pose_options = mp_vision.PoseLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=POSE_MODEL_PATH),
+        running_mode=mp_vision.RunningMode.VIDEO, num_poses=1,
+    )
+    results = []
+    hand_movement_frames = {"left": 0, "right": 0}
+    both_wrists_hidden_frames = 0
+    both_wrists_hidden_longest = 0
+    both_wrists_hidden_current = 0
+    prev_wrists = {"left": None, "right": None}
+
+    cap = cv2.VideoCapture(video_path)
+    with mp_vision.PoseLandmarker.create_from_options(pose_options) as pose_lm:
+        frame_idx = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if frame_idx % frame_interval != 0:
+                frame_idx += 1
+                continue
+            t_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC))
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+            sig = {"t": t_ms / 1000.0, "has_pose": False, "left_arm_dropped": None, "right_arm_dropped": None,
+                   "left_wrist_visible": None, "right_wrist_visible": None}
 
             pose_result = pose_lm.detect_for_video(mp_image, t_ms)
             if pose_result.pose_landmarks:
@@ -213,12 +232,11 @@ def analyze_body_language(video_path: str) -> dict:
                 l_hip, r_hip = (lm[23].x, lm[23].y), (lm[24].x, lm[24].y)
                 l_wr, r_wr = (lm[15].x, lm[15].y), (lm[16].x, lm[16].y)
 
-                sig.has_pose = True
-                sig.left_wrist, sig.right_wrist = l_wr, r_wr
-                sig.left_arm_dropped = check_arm_dropped(l_sh, l_hip, l_wr)
-                sig.right_arm_dropped = check_arm_dropped(r_sh, r_hip, r_wr)
-                sig.left_wrist_visible = lm[15].visibility > WRIST_VISIBILITY_THRESHOLD
-                sig.right_wrist_visible = lm[16].visibility > WRIST_VISIBILITY_THRESHOLD
+                sig["has_pose"] = True
+                sig["left_arm_dropped"] = check_arm_dropped(l_sh, l_hip, l_wr)
+                sig["right_arm_dropped"] = check_arm_dropped(r_sh, r_hip, r_wr)
+                sig["left_wrist_visible"] = lm[15].visibility > WRIST_VISIBILITY_THRESHOLD
+                sig["right_wrist_visible"] = lm[16].visibility > WRIST_VISIBILITY_THRESHOLD
 
                 for side, wrist in (("left", l_wr), ("right", r_wr)):
                     if prev_wrists[side] is not None:
@@ -227,12 +245,39 @@ def analyze_body_language(video_path: str) -> dict:
                             hand_movement_frames[side] += 1
                     prev_wrists[side] = wrist
 
-                if not sig.left_wrist_visible and not sig.right_wrist_visible:
+                if not sig["left_wrist_visible"] and not sig["right_wrist_visible"]:
                     both_wrists_hidden_frames += 1
                     both_wrists_hidden_current += 1
                     both_wrists_hidden_longest = max(both_wrists_hidden_longest, both_wrists_hidden_current)
                 else:
                     both_wrists_hidden_current = 0
+
+            results.append(sig)
+            frame_idx += 1
+    cap.release()
+    return results, hand_movement_frames, both_wrists_hidden_frames, both_wrists_hidden_longest
+
+
+def _run_gesture_pass(video_path: str, frame_interval: int):
+    gesture_options = mp_vision.GestureRecognizerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=GESTURE_MODEL_PATH),
+        running_mode=mp_vision.RunningMode.VIDEO, num_hands=2,
+    )
+    unusual_gesture_raw = []
+    cap = cv2.VideoCapture(video_path)
+    with mp_vision.GestureRecognizer.create_from_options(gesture_options) as gesture_lm:
+        frame_idx = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if frame_idx % frame_interval != 0:
+                frame_idx += 1
+                continue
+            t_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC))
+            t_s = t_ms / 1000.0
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
             gesture_result = gesture_lm.recognize_for_video(mp_image, t_ms)
             if gesture_result.gestures:
@@ -244,12 +289,39 @@ def analyze_body_language(video_path: str) -> dict:
                     if gesture_result.handedness and hand_idx < len(gesture_result.handedness):
                         hand_label = gesture_result.handedness[hand_idx][0].category_name
                     if top.category_name == "None" or top.score < UNUSUAL_GESTURE_CONFIDENCE:
-                        unusual_gesture_raw.append((sig.t, hand_label, top.category_name, round(top.score, 2)))
-
-            signals.append(sig)
+                        unusual_gesture_raw.append((t_s, hand_label, top.category_name, round(top.score, 2)))
             frame_idx += 1
-
     cap.release()
+    return unusual_gesture_raw
+
+
+def analyze_body_language(video_path: str) -> dict:
+    import gc
+
+    frame_interval, src_fps = _sample_frame_indices(video_path)
+
+    face_results = _run_face_pass(video_path, frame_interval)
+    gc.collect()
+
+    pose_results, hand_movement_frames, both_wrists_hidden_frames, both_wrists_hidden_longest = _run_pose_pass(video_path, frame_interval)
+    gc.collect()
+
+    unusual_gesture_raw = _run_gesture_pass(video_path, frame_interval)
+    gc.collect()
+
+    signals = []
+    for i in range(max(len(face_results), len(pose_results))):
+        sig = FrameSignals(t=face_results[i]["t"] if i < len(face_results) else pose_results[i]["t"])
+        if i < len(face_results):
+            f = face_results[i]
+            sig.has_face, sig.yaw_deg, sig.pitch_deg, sig.smile_score = f["has_face"], f["yaw_deg"], f["pitch_deg"], f["smile_score"]
+        if i < len(pose_results):
+            p = pose_results[i]
+            sig.has_pose = p["has_pose"]
+            sig.left_arm_dropped, sig.right_arm_dropped = p["left_arm_dropped"], p["right_arm_dropped"]
+            sig.left_wrist_visible, sig.right_wrist_visible = p["left_wrist_visible"], p["right_wrist_visible"]
+        signals.append(sig)
+
     seconds_per_sample = frame_interval / max(src_fps, 1)
     return summarize(signals, hand_movement_frames, both_wrists_hidden_frames, both_wrists_hidden_longest, seconds_per_sample, unusual_gesture_raw)
 
