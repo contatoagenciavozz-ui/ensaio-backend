@@ -20,6 +20,7 @@ import os
 import uuid
 import tempfile
 import logging
+import gc
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -65,6 +66,11 @@ def process_video(job_id: str, tmp_path: str, filename: str):
             logger.exception("[%s] Falha na transcrição", job_id)
             result["transcricao"] = None
             result["erro_transcricao"] = str(e)
+
+        # Libera qualquer memória residual do Whisper antes de carregar
+        # os modelos do MediaPipe — os dois juntos não cabem nos 512MB
+        # do plano gratuito.
+        gc.collect()
 
         try:
             logger.info("[%s] Analisando linguagem corporal", job_id)
