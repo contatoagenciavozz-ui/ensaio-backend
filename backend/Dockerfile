@@ -27,7 +27,7 @@ RUN mkdir -p models && \
 COPY app/ app/
 
 # Pré-baixa o modelo do Whisper também no build, pelo mesmo motivo.
-RUN python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')"
+RUN python -c "from faster_whisper import WhisperModel; WhisperModel('base', device='cpu', compute_type='int8')"
 
 ENV PORT=8000
 EXPOSE 8000
