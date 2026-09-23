@@ -29,6 +29,7 @@ WRIST_VISIBILITY_THRESHOLD = 0.3
 POCKET_STREAK_SECONDS = 1.5
 SMILE_SCORE_THRESHOLD = 0.35
 SERIOUS_SCORE_THRESHOLD = 0.08
+BLINK_SCORE_THRESHOLD = 0.4      # acima disso, quadro conta como "olho fechando". Amostragem de 5 quadros/s é mais lenta que um piscar (~0,1-0,4s) — provável subcontagem, não é uma taxa precisa de piscadas.
 UNUSUAL_GESTURE_CONFIDENCE = 0.5
 MIN_EPISODE_GAP_S = 0.6
 
@@ -40,6 +41,7 @@ class FrameSignals:
     yaw_deg: float = None
     pitch_deg: float = None
     smile_score: float = None
+    blink_score: float = None
     has_pose: bool = False
     left_arm_dropped: bool = None
     right_arm_dropped: bool = None
@@ -179,7 +181,7 @@ def _run_face_pass(video_path: str, frame_interval: int):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-            sig = {"t": t_ms / 1000.0, "has_face": False, "yaw_deg": None, "pitch_deg": None, "smile_score": None}
+            sig = {"t": t_ms / 1000.0, "has_face": False, "yaw_deg": None, "pitch_deg": None, "smile_score": None, "blink_score": None}
             face_result = face_lm.detect_for_video(mp_image, t_ms)
             if face_result.face_landmarks:
                 yaw, pitch = estimate_head_pose(face_result.face_landmarks[0], w, h)
@@ -190,6 +192,7 @@ def _run_face_pass(video_path: str, frame_interval: int):
                 if face_result.face_blendshapes:
                     cats = face_result.face_blendshapes[0]
                     sig["smile_score"] = (get_blendshape_score(cats, "mouthSmileLeft") + get_blendshape_score(cats, "mouthSmileRight")) / 2
+                    sig["blink_score"] = (get_blendshape_score(cats, "eyeBlinkLeft") + get_blendshape_score(cats, "eyeBlinkRight")) / 2
             results.append(sig)
             frame_idx += 1
     cap.release()
@@ -315,6 +318,7 @@ def analyze_body_language(video_path: str) -> dict:
         if i < len(face_results):
             f = face_results[i]
             sig.has_face, sig.yaw_deg, sig.pitch_deg, sig.smile_score = f["has_face"], f["yaw_deg"], f["pitch_deg"], f["smile_score"]
+            sig.blink_score = f["blink_score"]
         if i < len(pose_results):
             p = pose_results[i]
             sig.has_pose = p["has_pose"]
@@ -343,6 +347,20 @@ def summarize(signals, hand_movement_frames, both_wrists_hidden_frames, both_wri
     n_smile = len(smile_frames)
     smiling_frames = sum(1 for s in smile_frames if s.smile_score > SMILE_SCORE_THRESHOLD)
     serious_frames = sum(1 for s in smile_frames if s.smile_score < SERIOUS_SCORE_THRESHOLD)
+
+    # Piscadas: conta transições de "olho aberto" pra "olho fechando"
+    # (borda de subida), não quadros fechados isolados — evita contar um
+    # piscar sustentado por 2-3 quadros amostrados como várias piscadas.
+    blink_frames_seq = [s for s in face_frames if s.blink_score is not None]
+    blink_events = 0
+    prev_closed = False
+    for s in blink_frames_seq:
+        closed = s.blink_score > BLINK_SCORE_THRESHOLD
+        if closed and not prev_closed:
+            blink_events += 1
+        prev_closed = closed
+    blink_video_seconds = (blink_frames_seq[-1].t - blink_frames_seq[0].t) if len(blink_frames_seq) > 1 else 0
+    blinks_per_min = round(blink_events / (blink_video_seconds / 60), 1) if blink_video_seconds > 0 else None
 
     pose_frames = [s for s in signals if s.has_pose]
     n_pose = len(pose_frames)
@@ -380,6 +398,11 @@ def summarize(signals, hand_movement_frames, both_wrists_hidden_frames, both_wri
             "sorriso_pct": pct(smiling_frames, n_smile),
             "serio_pct": pct(serious_frames, n_smile),
         } if n_smile else None,
+        "piscadas_por_minuto_estimado": {
+            "valor": blinks_per_min,
+            "eventos_detectados": blink_events,
+            "confianca": "baixa — amostragem de 5 quadros/segundo é mais lenta que um piscar real; provável subcontagem, não é uma taxa precisa. Referência de literatura para adulto em repouso: ~15-20/min; em fala pública tende a subir com nervosismo, mas essa faixa não é regra fixa."
+        } if blinks_per_min is not None else None,
         "quadros_com_pose_detectada": n_pose,
         "mao_na_linha_da_cintura_esquerda_pct": pct(left_dropped, n_pose),
         "mao_na_linha_da_cintura_direita_pct": pct(right_dropped, n_pose),
