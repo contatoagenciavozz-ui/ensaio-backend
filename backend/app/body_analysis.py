@@ -52,6 +52,8 @@ class FrameSignals:
     right_wrist_visible: bool = None
     nose: tuple = None
     trunk_len: float = None
+    left_wrist_moved: bool = None
+    right_wrist_moved: bool = None
 
 
 def get_blendshape_score(categories, name):
@@ -126,14 +128,22 @@ def group_unusual_gestures(raw_events, max_gap_s):
     return episodes
 
 
-def longest_invisible_streak_seconds(pose_frames, side_attr):
+def longest_static_near_hip_streak_seconds(pose_frames, dropped_attr, moved_attr):
+    """Maior sequência contínua com o pulso perto do quadril E parado
+    (sem deslocamento perceptível entre quadros) — proxy de mão no
+    bolso. Trocado do sinal antigo (pulso 'invisível'), porque na
+    prática o pulso costuma continuar visível na boca do bolso; só os
+    dedos somem, e isso o modelo de pose não enxerga. Ainda é heurística:
+    braço parado relaxado ao lado do corpo também bate nesse padrão."""
     longest = 0
     current = 0
     current_start = None
     best_start = None
     for s in pose_frames:
-        visible = getattr(s, side_attr)
-        if visible is False:
+        dropped = getattr(s, dropped_attr)
+        moved = getattr(s, moved_attr)
+        static_near_hip = (dropped is True) and (moved is False)
+        if static_near_hip:
             if current == 0:
                 current_start = s.t
             current += 1
@@ -230,7 +240,8 @@ def _run_pose_pass(video_path: str, frame_interval: int):
 
             sig = {"t": t_ms / 1000.0, "has_pose": False, "left_arm_dropped": None, "right_arm_dropped": None,
                    "left_wrist_visible": None, "right_wrist_visible": None,
-                   "nose": None, "left_wrist": None, "right_wrist": None, "trunk_len": None}
+                   "nose": None, "left_wrist": None, "right_wrist": None, "trunk_len": None,
+                   "left_wrist_moved": None, "right_wrist_moved": None}
 
             pose_result = pose_lm.detect_for_video(mp_image, t_ms)
             if pose_result.pose_landmarks:
@@ -250,10 +261,13 @@ def _run_pose_pass(video_path: str, frame_interval: int):
                 sig["right_wrist_visible"] = lm[16].visibility > WRIST_VISIBILITY_THRESHOLD
 
                 for side, wrist in (("left", l_wr), ("right", r_wr)):
+                    moved = False
                     if prev_wrists[side] is not None:
                         d = math.hypot(wrist[0] - prev_wrists[side][0], wrist[1] - prev_wrists[side][1])
                         if d > HAND_MOVEMENT_ACTIVE_THRESHOLD:
+                            moved = True
                             hand_movement_frames[side] += 1
+                    sig[side + "_wrist_moved"] = moved
                     prev_wrists[side] = wrist
 
                 if not sig["left_wrist_visible"] and not sig["right_wrist_visible"]:
@@ -334,6 +348,7 @@ def analyze_body_language(video_path: str) -> dict:
             sig.left_wrist_visible, sig.right_wrist_visible = p["left_wrist_visible"], p["right_wrist_visible"]
             sig.nose, sig.trunk_len = p["nose"], p["trunk_len"]
             sig.left_wrist, sig.right_wrist = p["left_wrist"], p["right_wrist"]
+            sig.left_wrist_moved, sig.right_wrist_moved = p["left_wrist_moved"], p["right_wrist_moved"]
         signals.append(sig)
 
     seconds_per_sample = frame_interval / max(src_fps, 1)
@@ -380,8 +395,8 @@ def summarize(signals, hand_movement_frames, both_wrists_hidden_frames, both_wri
     def pct(n, total):
         return round(100 * n / total, 1) if total else None
 
-    left_streak_s, left_streak_start = longest_invisible_streak_seconds(pose_frames, "left_wrist_visible")
-    right_streak_s, right_streak_start = longest_invisible_streak_seconds(pose_frames, "right_wrist_visible")
+    left_streak_s, left_streak_start = longest_static_near_hip_streak_seconds(pose_frames, "left_arm_dropped", "left_wrist_moved")
+    right_streak_s, right_streak_start = longest_static_near_hip_streak_seconds(pose_frames, "right_arm_dropped", "right_wrist_moved")
     behind_back_s = round(both_wrists_hidden_longest * seconds_per_sample, 1)
 
     expressao_label = None
@@ -439,12 +454,12 @@ def summarize(signals, hand_movement_frames, both_wrists_hidden_frames, both_wri
             "confianca": "baixa — não distingue mãos atrás das costas de virar de costas ou sair do quadro"
         } if behind_back_s >= POCKET_STREAK_SECONDS else None,
         "mao_esquerda_possivel_bolso": {
-            "maior_periodo_sem_deteccao_s": left_streak_s, "inicio_aprox_s": left_streak_start,
-            "confianca": "baixa — não distingue bolso de virar de costas ou sair do quadro"
+            "maior_periodo_parado_perto_quadril_s": left_streak_s, "inicio_aprox_s": left_streak_start,
+            "confianca": "baixa — não distingue bolso de braço parado relaxado ao lado do corpo"
         } if left_streak_s >= POCKET_STREAK_SECONDS else None,
         "mao_direita_possivel_bolso": {
-            "maior_periodo_sem_deteccao_s": right_streak_s, "inicio_aprox_s": right_streak_start,
-            "confianca": "baixa — não distingue bolso de virar de costas ou sair do quadro"
+            "maior_periodo_parado_perto_quadril_s": right_streak_s, "inicio_aprox_s": right_streak_start,
+            "confianca": "baixa — não distingue bolso de braço parado relaxado ao lado do corpo"
         } if right_streak_s >= POCKET_STREAK_SECONDS else None,
         "formato_de_mao_incomum": {
             "total_episodios": len(gesture_episodes), "episodios": gesture_episodes[:20],
