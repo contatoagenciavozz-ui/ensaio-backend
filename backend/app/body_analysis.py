@@ -32,6 +32,7 @@ SERIOUS_SCORE_THRESHOLD = 0.08
 BLINK_SCORE_THRESHOLD = 0.4      # acima disso, quadro conta como "olho fechando". Amostragem de 5 quadros/s é mais lenta que um piscar (~0,1-0,4s) — provável subcontagem, não é uma taxa precisa de piscadas.
 UNUSUAL_GESTURE_CONFIDENCE = 0.5
 MIN_EPISODE_GAP_S = 0.6
+HAND_NEAR_FACE_RATIO = 0.4       # distância pulso-nariz até 40% do comprimento do tronco = possível mão perto/cobrindo o rosto. Heurística inicial, não calibrada.
 
 
 @dataclass
@@ -49,6 +50,8 @@ class FrameSignals:
     right_wrist: tuple = None
     left_wrist_visible: bool = None
     right_wrist_visible: bool = None
+    nose: tuple = None
+    trunk_len: float = None
 
 
 def get_blendshape_score(categories, name):
@@ -226,7 +229,8 @@ def _run_pose_pass(video_path: str, frame_interval: int):
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
             sig = {"t": t_ms / 1000.0, "has_pose": False, "left_arm_dropped": None, "right_arm_dropped": None,
-                   "left_wrist_visible": None, "right_wrist_visible": None}
+                   "left_wrist_visible": None, "right_wrist_visible": None,
+                   "nose": None, "left_wrist": None, "right_wrist": None, "trunk_len": None}
 
             pose_result = pose_lm.detect_for_video(mp_image, t_ms)
             if pose_result.pose_landmarks:
@@ -234,8 +238,12 @@ def _run_pose_pass(video_path: str, frame_interval: int):
                 l_sh, r_sh = (lm[11].x, lm[11].y), (lm[12].x, lm[12].y)
                 l_hip, r_hip = (lm[23].x, lm[23].y), (lm[24].x, lm[24].y)
                 l_wr, r_wr = (lm[15].x, lm[15].y), (lm[16].x, lm[16].y)
+                nose = (lm[0].x, lm[0].y)
 
                 sig["has_pose"] = True
+                sig["nose"] = nose
+                sig["left_wrist"], sig["right_wrist"] = l_wr, r_wr
+                sig["trunk_len"] = math.hypot(l_sh[0] - l_hip[0], l_sh[1] - l_hip[1])
                 sig["left_arm_dropped"] = check_arm_dropped(l_sh, l_hip, l_wr)
                 sig["right_arm_dropped"] = check_arm_dropped(r_sh, r_hip, r_wr)
                 sig["left_wrist_visible"] = lm[15].visibility > WRIST_VISIBILITY_THRESHOLD
@@ -324,6 +332,8 @@ def analyze_body_language(video_path: str) -> dict:
             sig.has_pose = p["has_pose"]
             sig.left_arm_dropped, sig.right_arm_dropped = p["left_arm_dropped"], p["right_arm_dropped"]
             sig.left_wrist_visible, sig.right_wrist_visible = p["left_wrist_visible"], p["right_wrist_visible"]
+            sig.nose, sig.trunk_len = p["nose"], p["trunk_len"]
+            sig.left_wrist, sig.right_wrist = p["left_wrist"], p["right_wrist"]
         signals.append(sig)
 
     seconds_per_sample = frame_interval / max(src_fps, 1)
@@ -387,6 +397,22 @@ def summarize(signals, hand_movement_frames, both_wrists_hidden_frames, both_wri
 
     gesture_episodes = group_unusual_gestures(unusual_gesture_raw, MIN_EPISODE_GAP_S)
 
+    # Mão perto/cobrindo o rosto: só verifica em quadros onde o rosto NÃO
+    # foi detectado (senão qualquer gesto perto do queixo contaria) — usa
+    # o nariz que a pose ainda enxerga mesmo quando o FaceLandmarker falha,
+    # como referência de "onde a cabeça está".
+    hand_near_face_raw = []
+    for s in signals:
+        if s.has_face or not s.has_pose or not s.nose or not s.trunk_len or s.trunk_len < 1e-6:
+            continue
+        for side, wrist in (("Left", s.left_wrist), ("Right", s.right_wrist)):
+            if wrist is None:
+                continue
+            dist = math.hypot(wrist[0] - s.nose[0], wrist[1] - s.nose[1])
+            if (dist / s.trunk_len) < HAND_NEAR_FACE_RATIO:
+                hand_near_face_raw.append((s.t, side, "perto_do_rosto", round(dist / s.trunk_len, 2)))
+    hand_near_face_episodes = group_unusual_gestures(hand_near_face_raw, MIN_EPISODE_GAP_S)
+
     return {
         "quadros_analisados": len(signals),
         "quadros_com_rosto_detectado": n_face,
@@ -424,6 +450,10 @@ def summarize(signals, hand_movement_frames, both_wrists_hidden_frames, both_wri
             "total_episodios": len(gesture_episodes), "episodios": gesture_episodes[:20],
             "nota": "Formato de mão que não bateu com os 7 gestos conhecidos do MediaPipe (ou bateu com baixa confiança) — inclui coisas banais como ajustar o microfone, coçar o rosto ou segurar um cartão. Lista de 'dá uma olhada aqui', não classificação do que é."
         } if gesture_episodes else None,
+        "mao_perto_do_rosto": {
+            "total_episodios": len(hand_near_face_episodes), "episodios": hand_near_face_episodes[:20],
+            "nota": "Quadros em que o rosto não foi detectado E o pulso estava perto de onde o nariz deveria estar (pela pose) — indício de mão cobrindo o rosto, não confirmação. Outras causas possíveis: virou o rosto de lado, saiu do quadro, iluminação ruim."
+        } if hand_near_face_episodes else None,
         "aviso": (
             "Percentuais por quadro amostrado, não por tempo de fala. Limiares são heurísticos — "
             "calibre contra vídeos anotados manualmente antes de confiar no valor absoluto. Sinais de "
