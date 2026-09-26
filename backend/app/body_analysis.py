@@ -250,25 +250,39 @@ def _run_pose_pass(video_path: str, frame_interval: int):
                 l_hip, r_hip = (lm[23].x, lm[23].y), (lm[24].x, lm[24].y)
                 l_wr, r_wr = (lm[15].x, lm[15].y), (lm[16].x, lm[16].y)
                 nose = (lm[0].x, lm[0].y)
+                l_wr_visible = lm[15].visibility > WRIST_VISIBILITY_THRESHOLD
+                r_wr_visible = lm[16].visibility > WRIST_VISIBILITY_THRESHOLD
 
                 sig["has_pose"] = True
                 sig["nose"] = nose
-                sig["left_wrist"], sig["right_wrist"] = l_wr, r_wr
                 sig["trunk_len"] = math.hypot(l_sh[0] - l_hip[0], l_sh[1] - l_hip[1])
-                sig["left_arm_dropped"] = check_arm_dropped(l_sh, l_hip, l_wr)
-                sig["right_arm_dropped"] = check_arm_dropped(r_sh, r_hip, r_wr)
-                sig["left_wrist_visible"] = lm[15].visibility > WRIST_VISIBILITY_THRESHOLD
-                sig["right_wrist_visible"] = lm[16].visibility > WRIST_VISIBILITY_THRESHOLD
+                sig["left_wrist_visible"] = l_wr_visible
+                sig["right_wrist_visible"] = r_wr_visible
 
-                for side, wrist in (("left", l_wr), ("right", r_wr)):
-                    moved = False
-                    if prev_wrists[side] is not None:
-                        d = math.hypot(wrist[0] - prev_wrists[side][0], wrist[1] - prev_wrists[side][1])
-                        if d > HAND_MOVEMENT_ACTIVE_THRESHOLD:
-                            moved = True
-                            hand_movement_frames[side] += 1
+                # Quando o pulso não está de fato visível (fora do quadro,
+                # ex: plano acima da cintura), o MediaPipe ainda devolve uma
+                # posição "chutada" com base no resto do corpo — usar essa
+                # posição pra calcular "mão na cintura" ou "mão em
+                # movimento" gerava leitura sem sentido pro usuário. Só
+                # guarda a posição e calcula os sinais dependentes dela
+                # quando a visibilidade passa do limiar.
+                sig["left_wrist"] = l_wr if l_wr_visible else None
+                sig["right_wrist"] = r_wr if r_wr_visible else None
+                sig["left_arm_dropped"] = check_arm_dropped(l_sh, l_hip, l_wr) if l_wr_visible else None
+                sig["right_arm_dropped"] = check_arm_dropped(r_sh, r_hip, r_wr) if r_wr_visible else None
+
+                for side, wrist, visible in (("left", l_wr, l_wr_visible), ("right", r_wr, r_wr_visible)):
+                    moved = None
+                    if visible:
+                        if prev_wrists[side] is not None:
+                            d = math.hypot(wrist[0] - prev_wrists[side][0], wrist[1] - prev_wrists[side][1])
+                            moved = d > HAND_MOVEMENT_ACTIVE_THRESHOLD
+                            if moved:
+                                hand_movement_frames[side] += 1
+                        prev_wrists[side] = wrist
+                    else:
+                        prev_wrists[side] = None  # perde o rastro — evita comparar posição real com "chute"
                     sig[side + "_wrist_moved"] = moved
-                    prev_wrists[side] = wrist
 
                 if not sig["left_wrist_visible"] and not sig["right_wrist_visible"]:
                     both_wrists_hidden_frames += 1
@@ -391,6 +405,17 @@ def summarize(signals, hand_movement_frames, both_wrists_hidden_frames, both_wri
     n_pose = len(pose_frames)
     left_dropped = sum(1 for s in pose_frames if s.left_arm_dropped)
     right_dropped = sum(1 for s in pose_frames if s.right_arm_dropped)
+    # Denominador certo pra "mão na cintura" e "mão em movimento" é quantos
+    # quadros o pulso ESTAVA de fato vis\u00edvel — não o total de quadros com
+    # pose detectada. Sem isso, um vídeo em plano fechado (mãos fora do
+    # quadro o tempo todo) dava percentual calculado em cima de posição
+    # chutada pelo modelo, não detecção real.
+    n_left_wrist_visible = sum(1 for s in pose_frames if s.left_wrist_visible)
+    n_right_wrist_visible = sum(1 for s in pose_frames if s.right_wrist_visible)
+    left_moved_assessable = sum(1 for s in pose_frames if s.left_wrist_moved is not None)
+    right_moved_assessable = sum(1 for s in pose_frames if s.right_wrist_moved is not None)
+    left_moved_true = sum(1 for s in pose_frames if s.left_wrist_moved is True)
+    right_moved_true = sum(1 for s in pose_frames if s.right_wrist_moved is True)
 
     def pct(n, total):
         return round(100 * n / total, 1) if total else None
@@ -420,8 +445,8 @@ def summarize(signals, hand_movement_frames, both_wrists_hidden_frames, both_wri
     for s in signals:
         if s.has_face or not s.has_pose or not s.nose or not s.trunk_len or s.trunk_len < 1e-6:
             continue
-        for side, wrist in (("Left", s.left_wrist), ("Right", s.right_wrist)):
-            if wrist is None:
+        for side, wrist, visible in (("Left", s.left_wrist, s.left_wrist_visible), ("Right", s.right_wrist, s.right_wrist_visible)):
+            if wrist is None or not visible:
                 continue
             dist = math.hypot(wrist[0] - s.nose[0], wrist[1] - s.nose[1])
             if (dist / s.trunk_len) < HAND_NEAR_FACE_RATIO:
@@ -445,10 +470,15 @@ def summarize(signals, hand_movement_frames, both_wrists_hidden_frames, both_wri
             "confianca": "baixa — amostragem de 5 quadros/segundo é mais lenta que um piscar real; provável subcontagem, não é uma taxa precisa. Referência de literatura para adulto em repouso: ~15-20/min; em fala pública tende a subir com nervosismo, mas essa faixa não é regra fixa."
         } if blinks_per_min is not None else None,
         "quadros_com_pose_detectada": n_pose,
-        "mao_na_linha_da_cintura_esquerda_pct": pct(left_dropped, n_pose),
-        "mao_na_linha_da_cintura_direita_pct": pct(right_dropped, n_pose),
-        "mao_esquerda_em_movimento_pct": pct(hand_movement_frames["left"], n_pose),
-        "mao_direita_em_movimento_pct": pct(hand_movement_frames["right"], n_pose),
+        "mao_na_linha_da_cintura_esquerda_pct": pct(left_dropped, n_left_wrist_visible),
+        "mao_na_linha_da_cintura_direita_pct": pct(right_dropped, n_right_wrist_visible),
+        "mao_esquerda_em_movimento_pct": pct(left_moved_true, left_moved_assessable),
+        "mao_direita_em_movimento_pct": pct(right_moved_true, right_moved_assessable),
+        "maos_fora_do_quadro": {
+            "esquerda_nunca_visivel": n_left_wrist_visible == 0 and n_pose > 0,
+            "direita_nunca_visivel": n_right_wrist_visible == 0 and n_pose > 0,
+            "nota": "Pulso não apareceu com confiança em nenhum quadro amostrado — provavelmente o enquadramento não mostra as mãos (ex: plano acima da cintura). Os campos de mão na cintura/em movimento ficam nulos nesse caso, em vez de calculados sobre posição estimada."
+        } if (n_pose > 0 and (n_left_wrist_visible == 0 or n_right_wrist_visible == 0)) else None,
         "maos_atras_das_costas": {
             "maior_periodo_ambas_ocultas_s": behind_back_s,
             "confianca": "baixa — não distingue mãos atrás das costas de virar de costas ou sair do quadro"
