@@ -16,6 +16,11 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
+try:
+    from app import gestos as gestos_mod      # no servidor (pacote app/)
+except ImportError:
+    import gestos as gestos_mod               # uso local, arquivo ao lado
+
 FACE_MODEL_PATH = "models/face_landmarker.task"
 POSE_MODEL_PATH = "models/pose_landmarker_lite.task"
 GESTURE_MODEL_PATH = "models/gesture_recognizer.task"
@@ -194,7 +199,7 @@ def _run_face_pass(video_path: str, frame_interval: int):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-            sig = {"t": t_ms / 1000.0, "has_face": False, "yaw_deg": None, "pitch_deg": None, "smile_score": None, "blink_score": None}
+            sig = {"t": t_ms / 1000.0, "has_face": False, "yaw_deg": None, "pitch_deg": None, "smile_score": None, "blink_score": None, "blink_left": None, "blink_right": None}
             face_result = face_lm.detect_for_video(mp_image, t_ms)
             if face_result.face_landmarks:
                 yaw, pitch = estimate_head_pose(face_result.face_landmarks[0], w, h)
@@ -205,7 +210,9 @@ def _run_face_pass(video_path: str, frame_interval: int):
                 if face_result.face_blendshapes:
                     cats = face_result.face_blendshapes[0]
                     sig["smile_score"] = (get_blendshape_score(cats, "mouthSmileLeft") + get_blendshape_score(cats, "mouthSmileRight")) / 2
-                    sig["blink_score"] = (get_blendshape_score(cats, "eyeBlinkLeft") + get_blendshape_score(cats, "eyeBlinkRight")) / 2
+                    sig["blink_left"] = get_blendshape_score(cats, "eyeBlinkLeft")
+                    sig["blink_right"] = get_blendshape_score(cats, "eyeBlinkRight")
+                    sig["blink_score"] = (sig["blink_left"] + sig["blink_right"]) / 2
             results.append(sig)
             frame_idx += 1
     cap.release()
@@ -241,7 +248,8 @@ def _run_pose_pass(video_path: str, frame_interval: int):
             sig = {"t": t_ms / 1000.0, "has_pose": False, "left_arm_dropped": None, "right_arm_dropped": None,
                    "left_wrist_visible": None, "right_wrist_visible": None,
                    "nose": None, "left_wrist": None, "right_wrist": None, "trunk_len": None,
-                   "left_wrist_moved": None, "right_wrist_moved": None}
+                   "left_wrist_moved": None, "right_wrist_moved": None,
+                   "mao_na_cintura": None}
 
             pose_result = pose_lm.detect_for_video(mp_image, t_ms)
             if pose_result.pose_landmarks:
@@ -270,6 +278,18 @@ def _run_pose_pass(video_path: str, frame_interval: int):
                 sig["right_wrist"] = r_wr if r_wr_visible else None
                 sig["left_arm_dropped"] = check_arm_dropped(l_sh, l_hip, l_wr) if l_wr_visible else None
                 sig["right_arm_dropped"] = check_arm_dropped(r_sh, r_hip, r_wr) if r_wr_visible else None
+
+                # mão na cintura: pulso na linha da cintura E cotovelo aberto para fora do tronco
+                trunk = sig["trunk_len"]
+                hip_flags = []
+                for sh, osh, el_i, wr, vis_w, dropped in (
+                    (l_sh, r_sh, 13, l_wr, l_wr_visible, sig["left_arm_dropped"]),
+                    (r_sh, l_sh, 14, r_wr, r_wr_visible, sig["right_arm_dropped"]),
+                ):
+                    el = (lm[el_i].x, lm[el_i].y)
+                    hip_flags.append(gestos_mod.is_hand_on_hip(
+                        sh, None, el, wr, osh, trunk, vis_w, lm[el_i].visibility > WRIST_VISIBILITY_THRESHOLD, bool(dropped)))
+                sig["mao_na_cintura"] = any(hip_flags)
 
                 for side, wrist, visible in (("left", l_wr, l_wr_visible), ("right", r_wr, r_wr_visible)):
                     moved = None
@@ -303,6 +323,8 @@ def _run_gesture_pass(video_path: str, frame_interval: int):
         running_mode=mp_vision.RunningMode.VIDEO, num_hands=2,
     )
     unusual_gesture_raw = []
+    hand_events = []     # (t, rótulo) dos gestos específicos (OK, indicador, pirâmide...)
+    hand_samples = 0
     cap = cv2.VideoCapture(video_path)
     with mp_vision.GestureRecognizer.create_from_options(gesture_options) as gesture_lm:
         frame_idx = 0
@@ -319,6 +341,13 @@ def _run_gesture_pass(video_path: str, frame_interval: int):
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
             gesture_result = gesture_lm.recognize_for_video(mp_image, t_ms)
+            hand_samples += 1
+            if gesture_result.hand_landmarks:
+                fh, fw = frame.shape[:2]
+                try:
+                    hand_events.extend(gestos_mod.frame_events(t_s, gesture_result.hand_landmarks, fw, fh))
+                except Exception:
+                    pass   # um quadro estranho não pode derrubar a análise inteira
             if gesture_result.gestures:
                 for hand_idx, hand_gestures in enumerate(gesture_result.gestures):
                     if not hand_gestures:
@@ -331,7 +360,7 @@ def _run_gesture_pass(video_path: str, frame_interval: int):
                         unusual_gesture_raw.append((t_s, hand_label, top.category_name, round(top.score, 2)))
             frame_idx += 1
     cap.release()
-    return unusual_gesture_raw
+    return unusual_gesture_raw, hand_events
 
 
 def analyze_body_language(video_path: str) -> dict:
@@ -345,7 +374,7 @@ def analyze_body_language(video_path: str) -> dict:
     pose_results, hand_movement_frames, both_wrists_hidden_frames, both_wrists_hidden_longest = _run_pose_pass(video_path, frame_interval)
     gc.collect()
 
-    unusual_gesture_raw = _run_gesture_pass(video_path, frame_interval)
+    unusual_gesture_raw, hand_events = _run_gesture_pass(video_path, frame_interval)
     gc.collect()
 
     signals = []
@@ -366,7 +395,23 @@ def analyze_body_language(video_path: str) -> dict:
         signals.append(sig)
 
     seconds_per_sample = frame_interval / max(src_fps, 1)
-    return summarize(signals, hand_movement_frames, both_wrists_hidden_frames, both_wrists_hidden_longest, seconds_per_sample, unusual_gesture_raw)
+
+    # gestos específicos: mãos (OK, indicador, dedo do meio, pirâmide) + mão na cintura (pose) + piscada (rosto)
+    events = list(hand_events)
+    for p in pose_results:
+        if p.get("mao_na_cintura"):
+            events.append((p["t"], "mao_na_cintura"))
+    for f in face_results:
+        if gestos_mod.is_wink(f.get("blink_left"), f.get("blink_right")):
+            events.append((f["t"], "piscada"))
+    gestos_especificos = gestos_mod.group(events, seconds_per_sample, len(signals))
+
+    out = summarize(signals, hand_movement_frames, both_wrists_hidden_frames, both_wrists_hidden_longest, seconds_per_sample, unusual_gesture_raw)
+    out["gestos_especificos"] = {
+        "gestos": gestos_especificos,
+        "nota": "Regras geométricas sobre os pontos da mão, do corpo e do rosto. Servem para avisar 'aconteceu em tal trecho, confira o vídeo', nunca como veredito. Mão pequena ou escondida no quadro reduz muito a detecção; piscada é a mais incerta (amostragem de 5 quadros por segundo).",
+    }
+    return out
 
 
 def summarize(signals, hand_movement_frames, both_wrists_hidden_frames, both_wrists_hidden_longest, seconds_per_sample, unusual_gesture_raw):
