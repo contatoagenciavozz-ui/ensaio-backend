@@ -397,7 +397,14 @@ def analyze_body_language(video_path: str) -> dict:
     seconds_per_sample = frame_interval / max(src_fps, 1)
 
     # gestos específicos: mãos (OK, indicador, dedo do meio, pirâmide) + mão na cintura (pose) + piscada (rosto)
-    events = list(hand_events)
+    # Mãos juntas (os dois pulsos perto um do outro, ex.: mãos unidas à frente do corpo): o modelo de
+    # mão costuma ver só uma delas e inventar gesto. Nesses quadros, descarta os gestos de uma mão só.
+    juntas = set()
+    for p in pose_results:
+        lw, rw, tl = p.get("left_wrist"), p.get("right_wrist"), p.get("trunk_len")
+        if lw and rw and tl and tl > 1e-6 and math.hypot(lw[0] - rw[0], lw[1] - rw[1]) / tl < gestos_mod.WRISTS_TOGETHER:
+            juntas.add(round(p["t"], 2))
+    events = [e for e in hand_events if not (e[1] in gestos_mod.SINGLE_HAND and round(e[0], 2) in juntas)]
     for p in pose_results:
         if p.get("mao_na_cintura"):
             events.append((p["t"], "mao_na_cintura"))

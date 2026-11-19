@@ -29,6 +29,8 @@ HIP_ELBOW_OUT = 0.15        # cotovelo para fora do ombro, em comprimentos de tr
 WINK_CLOSED = 0.6           # olho fechado
 WINK_OPEN = 0.3             # olho aberto
 HAND_OVERLAP_MAX = 0.15     # mãos que se sobrepõem mais que isso (mãos unidas, entrelaçadas): os pontos ficam confusos, não classifica
+WRISTS_TOGETHER = 0.4        # pulsos a menos de 40% do tronco um do outro = mãos juntas (braços soltos ao lado ficam em ~60% ou mais)
+SINGLE_HAND = ('ok', 'indicador_levantado', 'apontando', 'dedo_do_meio')
 MIN_SAMPLES = 2             # quadros seguidos para virar episódio (piscada: 1)
 GAP_S = 0.6
 
