@@ -28,6 +28,7 @@ MIN_HAND_PX = 40            # mão menor que isso (em pixels, pulso a base do m�
 HIP_ELBOW_OUT = 0.15        # cotovelo para fora do ombro, em comprimentos de tronco
 WINK_CLOSED = 0.6           # olho fechado
 WINK_OPEN = 0.3             # olho aberto
+HAND_OVERLAP_MAX = 0.15     # mãos que se sobrepõem mais que isso (mãos unidas, entrelaçadas): os pontos ficam confusos, não classifica
 MIN_SAMPLES = 2             # quadros seguidos para virar episódio (piscada: 1)
 GAP_S = 0.6
 
@@ -82,7 +83,7 @@ def classify_hand(lms, w, h):
     labels = []
 
     # OK: polegar e indicador se tocam, médio/anelar/mínimo abertos
-    if _d(P[4], P[8]) / s < OK_TIP_DIST and f["med"] == "est" and f["ane"] != "dob" and f["min"] != "dob":
+    if _d(P[4], P[8]) / s < OK_TIP_DIST and f["med"] == "est" and f["ane"] == "est" and f["min"] != "dob":
         labels.append("ok")
 
     # só o indicador estendido
@@ -131,11 +132,29 @@ def is_hand_on_hip(shoulder, hip, elbow, wrist, other_shoulder, trunk_len, wrist
     return out / trunk_len > HIP_ELBOW_OUT
 
 
+def _bbox(lms, w, h):
+    P = _hand_pts(lms, w, h)
+    xs, ys = [p[0] for p in P], [p[1] for p in P]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _overlap(a, b):
+    """Interseção das caixas das duas mãos, em fração da menor."""
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    area = lambda r: max(1e-6, (r[2] - r[0]) * (r[3] - r[1]))
+    return (ix * iy) / min(area(a), area(b))
+
+
 def frame_events(t, hands, w, h, blink_l=None, blink_r=None):
     """hands: lista de listas de landmarks (uma por mão detectada no quadro).
     Devolve [(t, rotulo)]."""
     ev = []
-    for lms in hands:
+    boxes = [_bbox(lms, w, h) for lms in hands]
+    for i, lms in enumerate(hands):
+        # mãos unidas ou entrelaçadas: o modelo confunde os dedos e inventa gestos
+        if any(_overlap(boxes[i], boxes[j]) > HAND_OVERLAP_MAX for j in range(len(hands)) if j != i):
+            continue
         for lab in classify_hand(lms, w, h):
             ev.append((t, lab))
     if len(hands) >= 2 and is_pyramid(hands[0], hands[1], w, h):
