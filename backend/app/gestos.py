@@ -24,6 +24,7 @@ PYRAMID_WRIST_MIN = 0.9     # pulsos afastados (palmas separadas); abaixo disso 
 FINGER_EXT = 1.25           # ponta / base do dedo, em relação ao pulso: acima = estendido
 FINGER_CURL = 1.05          # abaixo = dobrado
 POINT_UP_DEG = 35           # indicador a até 35° da vertical conta como "levantado"
+MIN_HAND_REL = 0.04         # mão menor que 4% da altura do quadro (pessoa longe da câmera): pontos pouco confiáveis, ignora
 MIN_HAND_PX = 40            # mão menor que isso (em pixels, pulso a base do médio) = pequena demais, ignora
 HIP_ELBOW_OUT = 0.15        # cotovelo para fora do ombro, em comprimentos de tronco
 WINK_CLOSED = 0.6           # olho fechado
@@ -80,7 +81,7 @@ def classify_hand(lms, w, h):
     """Rótulos de uma mão só. Devolve lista (pode ser vazia)."""
     P = _hand_pts(lms, w, h)
     s = hand_scale(P)
-    if s < MIN_HAND_PX:
+    if s < max(MIN_HAND_PX, MIN_HAND_REL * h):
         return []
     f = finger_state(P)
     labels = []
