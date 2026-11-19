@@ -249,7 +249,7 @@ def _run_pose_pass(video_path: str, frame_interval: int):
                    "left_wrist_visible": None, "right_wrist_visible": None,
                    "nose": None, "left_wrist": None, "right_wrist": None, "trunk_len": None,
                    "left_wrist_moved": None, "right_wrist_moved": None,
-                   "mao_na_cintura": None}
+                   "mao_na_cintura": None, "hip_y": None}
 
             pose_result = pose_lm.detect_for_video(mp_image, t_ms)
             if pose_result.pose_landmarks:
@@ -264,6 +264,7 @@ def _run_pose_pass(video_path: str, frame_interval: int):
                 sig["has_pose"] = True
                 sig["nose"] = nose
                 sig["trunk_len"] = math.hypot(l_sh[0] - l_hip[0], l_sh[1] - l_hip[1])
+                sig["hip_y"] = (l_hip[1] + r_hip[1]) / 2
                 sig["left_wrist_visible"] = l_wr_visible
                 sig["right_wrist_visible"] = r_wr_visible
 
@@ -405,6 +406,18 @@ def analyze_body_language(video_path: str) -> dict:
         if lw and rw and tl and tl > 1e-6 and math.hypot(lw[0] - rw[0], lw[1] - rw[1]) / tl < gestos_mod.WRISTS_TOGETHER:
             juntas.add(round(p["t"], 2))
     events = [e for e in hand_events if not (e[1] in gestos_mod.SINGLE_HAND and round(e[0], 2) in juntas)]
+
+    # "OK" só vale com a mão levantada (do peito para cima). Mãos na altura da barriga, como mãos unidas
+    # ou mexendo na roupa, são a causa mais comum de falso alarme.
+    levantadas = set()
+    for p in pose_results:
+        tl, hy = p.get("trunk_len"), p.get("hip_y")
+        if not tl or hy is None:
+            continue
+        for wr in (p.get("left_wrist"), p.get("right_wrist")):
+            if wr and (hy - wr[1]) / tl >= gestos_mod.OK_MIN_HEIGHT:
+                levantadas.add(round(p["t"], 2))
+    events = [e for e in events if not (e[1] == "ok" and round(e[0], 2) not in levantadas)]
     for p in pose_results:
         if p.get("mao_na_cintura"):
             events.append((p["t"], "mao_na_cintura"))

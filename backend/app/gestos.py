@@ -31,6 +31,7 @@ WINK_OPEN = 0.3             # olho aberto
 HAND_OVERLAP_MAX = 0.15     # mãos que se sobrepõem mais que isso (mãos unidas, entrelaçadas): os pontos ficam confusos, não classifica
 WRISTS_TOGETHER = 0.4        # pulsos a menos de 40% do tronco um do outro = mãos juntas (braços soltos ao lado ficam em ~60% ou mais)
 SINGLE_HAND = ('ok', 'indicador_levantado', 'apontando', 'dedo_do_meio')
+OK_MIN_HEIGHT = 0.6          # pulso pelo menos 60% do tronco acima do quadril (peito para cima) para valer como "OK"
 MIN_SAMPLES = 2             # quadros seguidos para virar episódio (piscada: 1)
 GAP_S = 0.6
 
@@ -100,6 +101,13 @@ def classify_hand(lms, w, h):
     return labels
 
 
+def ok_score(lms, w, h):
+    """0 a 1: quanto o círculo do polegar com o indicador está fechado (1 = pontas coladas)."""
+    P = _hand_pts(lms, w, h)
+    s = hand_scale(P)
+    return max(0.0, 1 - (_d(P[4], P[8]) / s) / OK_TIP_DIST) if s else 0.0
+
+
 def is_pyramid(lms_a, lms_b, w, h):
     """Pontas dos dedos das duas mãos se tocando, com as palmas afastadas."""
     A, B = _hand_pts(lms_a, w, h), _hand_pts(lms_b, w, h)
@@ -158,11 +166,11 @@ def frame_events(t, hands, w, h, blink_l=None, blink_r=None):
         if any(_overlap(boxes[i], boxes[j]) > HAND_OVERLAP_MAX for j in range(len(hands)) if j != i):
             continue
         for lab in classify_hand(lms, w, h):
-            ev.append((t, lab))
+            ev.append((t, lab, ok_score(lms, w, h) if lab == "ok" else 0.5))
     if len(hands) >= 2 and is_pyramid(hands[0], hands[1], w, h):
-        ev.append((t, "piramide"))
+        ev.append((t, "piramide", 0.5))
     if is_wink(blink_l, blink_r):
-        ev.append((t, "piscada"))
+        ev.append((t, "piscada", 0.5))
     return ev
 
 
@@ -170,19 +178,20 @@ def group(events, seconds_per_sample, total_samples):
     """Junta quadros seguidos do mesmo gesto em episódios.
     events: [(t, rotulo)]. Devolve dict rotulo -> info (só os que apareceram)."""
     by = {}
-    for t, lab in events:
-        by.setdefault(lab, []).append(t)
+    for e in events:
+        t, lab = e[0], e[1]
+        by.setdefault(lab, []).append((t, e[2] if len(e) > 2 else 0.5))
     out = {}
     for lab, ts in by.items():
         ts.sort()
         eps, cur = [], None
-        for t in ts:
+        for t, sc in ts:
             if cur and t - cur["fim"] <= max(GAP_S, seconds_per_sample * 1.5):
-                cur["fim"], cur["n"] = t, cur["n"] + 1
+                cur["fim"], cur["n"], cur["soma"] = t, cur["n"] + 1, cur["soma"] + sc
             else:
                 if cur:
                     eps.append(cur)
-                cur = {"inicio": t, "fim": t, "n": 1}
+                cur = {"inicio": t, "fim": t, "n": 1, "soma": sc}
         if cur:
             eps.append(cur)
         need = 1 if lab == "piscada" else MIN_SAMPLES
@@ -190,7 +199,10 @@ def group(events, seconds_per_sample, total_samples):
         if not eps:
             continue
         frames = sum(e["n"] for e in eps)
+        # melhor momento: maior pontuação média; empate = o mais longo
+        best = max(eps, key=lambda e: (round(e["soma"] / e["n"], 2), e["n"]))
         out[lab] = {
+            "melhor_momento": {"inicio_s": round(best["inicio"], 1), "fim_s": round(best["fim"], 1)},
             "descricao": ROTULOS.get(lab, lab),
             "total_episodios": len(eps),
             "pct_dos_quadros": round(100 * frames / total_samples, 1) if total_samples else None,
